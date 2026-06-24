@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""
+Read EMG samples streamed from an STM32 serial port and show a live plot.
+
+Example:
+    python3 live_visualization.py --port /dev/cu.usbmodem1103 --baud 115200
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+import time
+from collections import deque
+from pathlib import Path
+
+LOCAL_MATPLOTLIB_CACHE = Path(__file__).resolve().parent / ".matplotlib"
+os.environ.setdefault("MPLCONFIGDIR", str(LOCAL_MATPLOTLIB_CACHE))
+LOCAL_MATPLOTLIB_CACHE.mkdir(exist_ok=True)
+
+try:
+    import matplotlib.pyplot as plt
+except ImportError as exc:
+    raise SystemExit(
+        "matplotlib is not installed. Install it with: python3 -m pip install matplotlib"
+    ) from exc
+
+try:
+    import serial
+    from serial.tools import list_ports
+except ImportError as exc:
+    raise SystemExit(
+        "pyserial is not installed. Install it with: python3 -m pip install pyserial"
+    ) from exc
+
+NUMBER_PATTERN = re.compile(r"[-+]?(?:\d+\.\d+|\d+|\.\d+)(?:[eE][-+]?\d+)?")
+DEFAULT_BAUD = 200000
+DEFAULT_MAX_VALUES = 1
+DEFAULT_PLOT_RATE_HZ = 30.0
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Read EMG values from STM32 serial and plot them live."
+    )
+    parser.add_argument(
+        "-p",
+        "--port",
+        help="Serial port, for example /dev/cu.usbmodem1103 or COM3.",
+    )
+    parser.add_argument(
+        "-b",
+        "--baud",
+        type=int,
+        default=DEFAULT_BAUD,
+        help=f"Baud rate used by the STM32 firmware. Default: {DEFAULT_BAUD}.",
+    )
+    parser.add_argument(
+        "-d",
+        "--duration",
+        type=float,
+        default=None,
+        help="Seconds to run before stopping. Omit to run until Ctrl+C.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=1.0,
+        help="Serial read timeout in seconds. Default: 1.0.",
+    )
+    parser.add_argument(
+        "--window-size",
+        type=int,
+        default=200,
+        help="Number of recent samples to keep on the plot. Default: 200.",
+    )
+    parser.add_argument(
+        "--max-values",
+        type=int,
+        default=DEFAULT_MAX_VALUES,
+        help=f"Maximum numeric values per sample to plot. Default: {DEFAULT_MAX_VALUES}.",
+    )
+    parser.add_argument(
+        "--title",
+        default="STM32 EMG Live Visualization",
+        help="Window title and plot title. Default: STM32 EMG Live Visualization.",
+    )
+    parser.add_argument(
+        "--plot-rate",
+        type=float,
+        default=DEFAULT_PLOT_RATE_HZ,
+        help=f"Maximum graph refresh rate in Hz. Default: {DEFAULT_PLOT_RATE_HZ:g}.",
+    )
+    parser.add_argument(
+        "--list-ports",
+        action="store_true",
+        help="Show available serial ports and exit.",
+    )
+    return parser.parse_args()
+
+
+def available_ports() -> list[str]:
+    return [port.device for port in list_ports.comports()]
+
+
+def print_ports() -> None:
+    ports = list(list_ports.comports())
+    if not ports:
+        print("No serial ports found.")
+        return
+
+    print("Available serial ports:")
+    for port in ports:
+        description = port.description or "no description"
+        print(f"  {port.device}  ({description})")
+
+
+def choose_default_port() -> str:
+    ports = available_ports()
+    preferred = [
+        port
+        for port in ports
+        if "usbmodem" in port.lower()
+        or "usbserial" in port.lower()
+        or "wchusbserial" in port.lower()
+    ]
+
+    if preferred:
+        return preferred[0]
+
+    if len(ports) == 1:
+        return ports[0]
+
+    print_ports()
+    raise SystemExit("Choose a port with --port.")
+
+
+def numbers_from_line(line: str) -> list[float]:
+    return [float(match.group(0)) for match in NUMBER_PATTERN.finditer(line)]
+
+
+def create_plot(num_series: int, title: str) -> tuple[plt.Figure, plt.Axes, list[plt.Line2D]]:
+    fig, ax = plt.subplots(figsize=(10, 6))
+    lines = []
+    for index in range(num_series):
+        line_obj, = ax.plot([], [], marker="o", markersize=3, linewidth=1.2, label=f"channel {index + 1}")
+        lines.append(line_obj)
+
+    ax.set_title(title)
+    ax.set_xlabel("elapsed seconds")
+    ax.set_ylabel("EMG value")
+    ax.set_ylim(0, 4095)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    return fig, ax, lines
+
+
+def update_lines(
+    lines: list[plt.Line2D],
+    time_history: deque[float],
+    value_history: list[deque[float]],
+) -> None:
+    for line_obj, series in zip(lines, value_history):
+        line_obj.set_data(time_history, list(series))
+
+
+def main() -> int:
+    args = parse_args()
+
+    if args.list_ports:
+        print_ports()
+        return 0
+
+    port = args.port or choose_default_port()
+    sample_count = 0
+    start_time = time.monotonic()
+
+    fig, ax, lines = create_plot(args.max_values, args.title)
+    fig.canvas.manager.set_window_title(args.title)
+    plt.ion()
+    plt.show(block=False)
+
+    time_history: deque[float] = deque(maxlen=args.window_size)
+    value_history: list[deque[float]] = [deque(maxlen=args.window_size) for _ in range(args.max_values)]
+    plot_interval = 1.0 / args.plot_rate if args.plot_rate > 0 else 0.0
+    last_plot_update = 0.0
+
+    try:
+        with serial.Serial(port=port, baudrate=args.baud, timeout=args.timeout) as ser:
+            print(f"Reading EMG from {port} at {args.baud} baud")
+            print("Press Ctrl+C to stop.")
+
+            while True:
+                if args.duration is not None and time.monotonic() - start_time >= args.duration:
+                    print("\nDuration reached. Exiting.")
+                    break
+
+                raw_bytes = ser.readline()
+                if not raw_bytes:
+                    plt.pause(0.01)
+                    continue
+
+                elapsed = time.monotonic() - start_time
+                line = raw_bytes.decode("utf-8", errors="replace").strip()
+                values = numbers_from_line(line)
+                sample_count += 1
+
+                if values:
+                    values_text = ", ".join(f"{value:g}" for value in values)
+                else:
+                    values_text = line
+
+                print(f"{sample_count:>6}  {elapsed:>9.3f}s  {values_text}")
+
+                if values:
+                    time_history.append(elapsed)
+                    for index in range(args.max_values):
+                        if index < len(values):
+                            value_history[index].append(values[index])
+                        else:
+                            value_history[index].append(float("nan"))
+
+                    if elapsed - last_plot_update >= plot_interval:
+                        update_lines(lines, time_history, value_history)
+                        ax.relim()
+                        ax.autoscale_view()
+                        fig.canvas.draw_idle()
+                        last_plot_update = elapsed
+
+                plt.pause(0.001)
+
+    except KeyboardInterrupt:
+        print("\nStopped by user.")
+    except serial.SerialException as exc:
+        print(f"Serial error: {exc}", file=sys.stderr)
+        return 1
+
+    if plt.fignum_exists(fig.number):
+        print("Streaming ended. Close the plot window to exit.")
+        plt.ioff()
+        plt.show(block=True)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
